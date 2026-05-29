@@ -7,6 +7,7 @@ import json
 import random
 import re
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +18,7 @@ import streamlit.components.v1 as components
 APP_DIR = Path(__file__).parent
 DEFAULT_QUESTION_FILE = APP_DIR / "questions.csv"
 ROUND_SIZE = 20
-ROUND_CODES = {
-    "round1": 0,
-    "round2": 1,
-    "round3": 2,
-}
+ROUND_SEED = "fixed-trivia-rounds-v2-easy"
 
 
 def format_elapsed(seconds: float) -> str:
@@ -41,10 +38,110 @@ def normalize_answer(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", clean(value).casefold()).strip()
 
 
-def answer_matches(selected_answer: str, correct_answer: str) -> bool:
+def remove_leading_article(value: str) -> str:
+    return re.sub(r"^(a|an|the)\s+", "", value).strip()
+
+
+def text_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def asks_for_person(question_text: str) -> bool:
+    question = normalize_answer(question_text)
+    person_cues = {
+        "artist",
+        "author",
+        "composer",
+        "director",
+        "emperor",
+        "explorer",
+        "founder",
+        "inventor",
+        "king",
+        "leader",
+        "novelist",
+        "painter",
+        "philosopher",
+        "playwright",
+        "poet",
+        "president",
+        "queen",
+        "scientist",
+        "singer",
+        "writer",
+    }
+    return question.startswith("who") or any(cue in question.split() for cue in person_cues)
+
+
+def fuzzy_answer_matches(selected_answer: str, correct_answer: str) -> bool:
+    selected = remove_leading_article(normalize_answer(selected_answer))
+    correct = remove_leading_article(normalize_answer(correct_answer))
+    if not selected or not correct:
+        return False
+    if selected == correct:
+        return True
+    if min(len(selected), len(correct)) < 5:
+        return False
+
+    length_gap = abs(len(selected) - len(correct)) / max(len(selected), len(correct))
+    if length_gap > 0.35:
+        return False
+
+    sorted_selected = " ".join(sorted(selected.split()))
+    sorted_correct = " ".join(sorted(correct.split()))
+    threshold = 0.86 if max(len(selected), len(correct)) >= 8 else 0.92
+    return max(text_similarity(selected, correct), text_similarity(sorted_selected, sorted_correct)) >= threshold
+
+
+def last_name_matches(selected_answer: str, correct_answer: str, question_text: str) -> bool:
+    selected = remove_leading_article(normalize_answer(selected_answer))
+    correct = remove_leading_article(normalize_answer(correct_answer))
+    correct_parts = correct.split()
+    if len(correct_parts) < 2 or len(correct_parts) > 4:
+        return False
+    if not asks_for_person(question_text):
+        return False
+
+    suffixes = {"jr", "sr", "ii", "iii", "iv", "v"}
+    if correct_parts[-1] in suffixes and len(correct_parts) > 2:
+        correct_parts = correct_parts[:-1]
+
+    last_name = correct_parts[-1]
+    if len(last_name) < 4:
+        return False
+
+    place_prefixes = {
+        "new",
+        "north",
+        "south",
+        "east",
+        "west",
+        "united",
+        "great",
+        "mount",
+        "lake",
+        "saint",
+        "st",
+    }
+    if correct_parts[0] in place_prefixes:
+        return False
+
+    surname_particles = {"da", "de", "del", "di", "du", "la", "le", "van", "von"}
+    surname_forms = {last_name}
+    if len(correct_parts) >= 2 and correct_parts[-2] in surname_particles:
+        surname_forms.add(" ".join(correct_parts[-2:]))
+
+    return selected in surname_forms
+
+
+def answer_matches(selected_answer: str, correct_answer: str, question_text: str = "") -> bool:
     accepted_answers = re.split(r"\s*[|;]\s*", correct_answer)
-    selected = normalize_answer(selected_answer)
-    return any(selected == normalize_answer(answer) for answer in accepted_answers if answer)
+    return any(
+        fuzzy_answer_matches(selected_answer, answer)
+        or last_name_matches(selected_answer, answer, question_text)
+        for answer in accepted_answers
+        if answer
+    )
 
 
 def game_code_seed(game_code: str) -> int:
@@ -53,11 +150,19 @@ def game_code_seed(game_code: str) -> int:
     return int(digest[:16], 16)
 
 
+def round_count_for(questions: list[dict[str, Any]]) -> int:
+    return len(questions) // ROUND_SIZE
+
+
+def round_codes_for(questions: list[dict[str, Any]]) -> list[str]:
+    return [f"round{index}" for index in range(1, round_count_for(questions) + 1)]
+
+
 def build_round_questions(questions: list[dict[str, Any]], game_code: str) -> list[dict[str, Any]]:
     normalized = clean(game_code).casefold()
-    round_number = ROUND_CODES[normalized]
+    round_number = int(normalized.removeprefix("round")) - 1
     question_order = list(questions)
-    random.Random(game_code_seed("fixed-trivia-rounds-v1")).shuffle(question_order)
+    random.Random(game_code_seed(ROUND_SEED)).shuffle(question_order)
     start = round_number * ROUND_SIZE
     return question_order[start : start + ROUND_SIZE]
 
@@ -177,6 +282,9 @@ def reset_game() -> None:
         "is_answer_submitted",
     ]:
         st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("answer_"):
+            st.session_state.pop(key, None)
 
 
 def start_game(player_name: str, game_code: str, questions: list[dict[str, Any]]) -> None:
@@ -193,7 +301,7 @@ def start_game(player_name: str, game_code: str, questions: list[dict[str, Any]]
 
 
 def submit_answer(question: dict[str, Any], selected_answer: str) -> None:
-    correct = answer_matches(selected_answer, question["answer"])
+    correct = answer_matches(selected_answer, question["answer"], question["question"])
     if correct:
         st.session_state.score += 1
     st.session_state.answers.append(
@@ -292,15 +400,16 @@ def main() -> None:
     if not active_questions:
         st.warning("Add questions to questions.csv to start.")
         return
-    if len(active_questions) < ROUND_SIZE * len(ROUND_CODES):
-        st.warning(f"questions.csv needs at least {ROUND_SIZE * len(ROUND_CODES)} questions for all three rounds.")
+    round_codes = round_codes_for(active_questions)
+    if not round_codes:
+        st.warning(f"questions.csv needs at least {ROUND_SIZE} questions to start.")
         return
 
     if "game_questions" not in st.session_state:
         with st.form("start_form"):
             player_name = st.text_input("Name", placeholder="Put your name in")
-            game_code = st.selectbox("Round code", list(ROUND_CODES.keys()))
-            st.caption(f"Each round code gives everyone the same {ROUND_SIZE} questions.")
+            game_code = st.selectbox("Round code", round_codes)
+            st.caption(f"{len(round_codes)} rounds available. Each round gives everyone the same {ROUND_SIZE} questions.")
             start = st.form_submit_button("Start game", use_container_width=True)
             if start:
                 if not player_name.strip():
@@ -340,9 +449,14 @@ def main() -> None:
             question["choices"],
             index=None,
             disabled=st.session_state.is_answer_submitted,
+            key=f"answer_{st.session_state.current_index}",
         )
     else:
-        selected_answer = st.text_input("Your answer", disabled=st.session_state.is_answer_submitted)
+        selected_answer = st.text_input(
+            "Your answer",
+            disabled=st.session_state.is_answer_submitted,
+            key=f"answer_{st.session_state.current_index}",
+        )
 
     if not st.session_state.is_answer_submitted:
         can_submit = bool(selected_answer and selected_answer.strip())
