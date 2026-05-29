@@ -207,7 +207,7 @@ def move_next() -> None:
     st.session_state.current_index += 1
     st.session_state.submitted_answer = None
     st.session_state.is_answer_submitted = False
-    if st.session_state.current_index >= len(st.session_state.question_order):
+    if st.session_state.current_index >= len(st.session_state.game_questions):
         st.session_state.stopped_at = time.time()
 
 
