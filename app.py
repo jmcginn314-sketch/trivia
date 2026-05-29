@@ -197,12 +197,6 @@ def submit_answer(question: dict[str, Any], selected_answer: str) -> None:
     st.session_state.is_answer_submitted = True
 
 
-def mark_last_answer_correct() -> None:
-    if st.session_state.answers and not st.session_state.answers[-1]["is_correct"]:
-        st.session_state.answers[-1]["is_correct"] = True
-        st.session_state.score += 1
-
-
 def move_next() -> None:
     st.session_state.current_index += 1
     st.session_state.submitted_answer = None
@@ -358,9 +352,6 @@ def main() -> None:
             st.success("Correct.")
         else:
             st.error(f"Incorrect. Correct answer: {question['answer']}")
-            if not question["choices"] and st.button("Count my answer as correct", use_container_width=True):
-                mark_last_answer_correct()
-                st.rerun()
 
         label = "Finish" if st.session_state.current_index == total_questions - 1 else "Next question"
         if st.button(label, use_container_width=True):
