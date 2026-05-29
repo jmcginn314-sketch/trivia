@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import random
@@ -15,6 +16,12 @@ import streamlit.components.v1 as components
 
 APP_DIR = Path(__file__).parent
 DEFAULT_QUESTION_FILE = APP_DIR / "questions.csv"
+ROUND_SIZE = 20
+ROUND_CODES = {
+    "round1": 0,
+    "round2": 1,
+    "round3": 2,
+}
 
 
 def format_elapsed(seconds: float) -> str:
@@ -38,6 +45,21 @@ def answer_matches(selected_answer: str, correct_answer: str) -> bool:
     accepted_answers = re.split(r"\s*[|;]\s*", correct_answer)
     selected = normalize_answer(selected_answer)
     return any(selected == normalize_answer(answer) for answer in accepted_answers if answer)
+
+
+def game_code_seed(game_code: str) -> int:
+    normalized = clean(game_code).casefold()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def build_round_questions(questions: list[dict[str, Any]], game_code: str) -> list[dict[str, Any]]:
+    normalized = clean(game_code).casefold()
+    round_number = ROUND_CODES[normalized]
+    question_order = list(questions)
+    random.Random(game_code_seed("fixed-trivia-rounds-v1")).shuffle(question_order)
+    start = round_number * ROUND_SIZE
+    return question_order[start : start + ROUND_SIZE]
 
 
 def first_value(row: dict[str, Any], *names: str) -> str:
@@ -141,18 +163,10 @@ def load_default_questions(path: str, modified_at: float) -> list[dict[str, Any]
     return parse_csv_questions(contents)
 
 
-def load_uploaded_questions(uploaded_file: Any) -> list[dict[str, Any]]:
-    if not uploaded_file:
-        return []
-    contents = uploaded_file.getvalue().decode("utf-8-sig")
-    if uploaded_file.name.lower().endswith(".json"):
-        return parse_json_questions(contents)
-    return parse_csv_questions(contents)
-
-
 def reset_game() -> None:
     for key in [
         "player_name",
+        "game_code",
         "game_questions",
         "current_index",
         "score",
@@ -165,12 +179,10 @@ def reset_game() -> None:
         st.session_state.pop(key, None)
 
 
-def start_game(player_name: str, questions: list[dict[str, Any]], count: int, shuffle: bool) -> None:
-    question_order = list(questions)
-    if shuffle:
-        random.shuffle(question_order)
+def start_game(player_name: str, game_code: str, questions: list[dict[str, Any]]) -> None:
     st.session_state.player_name = player_name.strip()
-    st.session_state.game_questions = question_order[:count]
+    st.session_state.game_code = game_code.strip()
+    st.session_state.game_questions = build_round_questions(questions, game_code)
     st.session_state.current_index = 0
     st.session_state.score = 0
     st.session_state.answers = []
@@ -244,6 +256,9 @@ def render_scoreboard(total_questions: int) -> None:
     with st.sidebar:
         st.subheader("Game")
         st.write(f"Player: **{st.session_state.player_name}**")
+        game_code = st.session_state.get("game_code", "")
+        if game_code:
+            st.write(f"Code: **{game_code}**")
         col_a, col_b = st.columns(2)
         col_a.metric("Score", f"{st.session_state.score}/{total_questions}")
         col_b.metric("Question", f"{min(st.session_state.current_index + 1, total_questions)}/{total_questions}")
@@ -272,39 +287,27 @@ def main() -> None:
     st.title("Trivia Game")
 
     default_modified_at = DEFAULT_QUESTION_FILE.stat().st_mtime if DEFAULT_QUESTION_FILE.exists() else 0
-    default_questions = load_default_questions(str(DEFAULT_QUESTION_FILE), default_modified_at)
-
-    with st.sidebar:
-        st.header("Questions")
-        uploaded_file = st.file_uploader("Use a CSV or JSON question bank", type=["csv", "json"])
-        uploaded_questions = load_uploaded_questions(uploaded_file)
-        active_questions = uploaded_questions or default_questions
-        source_name = uploaded_file.name if uploaded_file else DEFAULT_QUESTION_FILE.name
-        st.caption(f"Loaded {len(active_questions)} questions from {source_name}.")
+    active_questions = load_default_questions(str(DEFAULT_QUESTION_FILE), default_modified_at)
 
     if not active_questions:
-        st.warning("Add questions to questions.csv or upload a CSV/JSON question bank to start.")
+        st.warning("Add questions to questions.csv to start.")
+        return
+    if len(active_questions) < ROUND_SIZE * len(ROUND_CODES):
+        st.warning(f"questions.csv needs at least {ROUND_SIZE * len(ROUND_CODES)} questions for all three rounds.")
         return
 
     if "game_questions" not in st.session_state:
         with st.form("start_form"):
             player_name = st.text_input("Name", placeholder="Put your name in")
-            question_count = st.number_input(
-                "Questions this round",
-                min_value=1,
-                max_value=len(active_questions),
-                value=len(active_questions),
-                step=1,
-            )
-            shuffle_questions = st.checkbox("Shuffle questions", value=True)
+            game_code = st.selectbox("Round code", list(ROUND_CODES.keys()))
+            st.caption(f"Each round code gives everyone the same {ROUND_SIZE} questions.")
             start = st.form_submit_button("Start game", use_container_width=True)
             if start:
                 if not player_name.strip():
                     st.error("Enter a name to start.")
                 else:
-                    start_game(player_name, active_questions, int(question_count), shuffle_questions)
+                    start_game(player_name, game_code, active_questions)
                     st.rerun()
-        st.info("Replace questions.csv with your full reserve bank whenever you are ready.")
         return
 
     total_questions = len(st.session_state.game_questions)
