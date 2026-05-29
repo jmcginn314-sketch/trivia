@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import random
 import re
 import time
@@ -18,7 +19,9 @@ import streamlit.components.v1 as components
 APP_DIR = Path(__file__).parent
 DEFAULT_QUESTION_FILE = APP_DIR / "questions.csv"
 ROUND_SIZE = 20
-ROUND_SEED = "fixed-trivia-rounds-v2-easy"
+ROUND_SEED = "fixed-trivia-rounds-v3-jeopardy"
+ALL_CATEGORIES = "All categories"
+CHOICE_COUNT = 4
 
 
 def format_elapsed(seconds: float) -> str:
@@ -151,20 +154,93 @@ def game_code_seed(game_code: str) -> int:
 
 
 def round_count_for(questions: list[dict[str, Any]]) -> int:
-    return len(questions) // ROUND_SIZE
+    if not questions:
+        return 0
+    return math.ceil(len(questions) / ROUND_SIZE)
 
 
 def round_codes_for(questions: list[dict[str, Any]]) -> list[str]:
     return [f"round{index}" for index in range(1, round_count_for(questions) + 1)]
 
 
-def build_round_questions(questions: list[dict[str, Any]], game_code: str) -> list[dict[str, Any]]:
+def category_options_for(questions: list[dict[str, Any]]) -> list[str]:
+    categories = sorted({question["category"] for question in questions if question["category"]})
+    return [ALL_CATEGORIES, *categories]
+
+
+def questions_for_category(questions: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
+    if category == ALL_CATEGORIES:
+        return questions
+    return [question for question in questions if question["category"] == category]
+
+
+def answer_marker(answer: str) -> str:
+    return normalize_answer(answer)
+
+
+def unique_wrong_answers(questions: list[dict[str, Any]], correct_answer: str) -> list[str]:
+    correct_marker = answer_marker(correct_answer)
+    answers = []
+    seen = {correct_marker}
+    for question in questions:
+        answer = clean(question["answer"])
+        marker = answer_marker(answer)
+        if not answer or not marker or marker in seen:
+            continue
+        seen.add(marker)
+        answers.append(answer)
+    return answers
+
+
+def add_multiple_choice_options(
+    round_questions: list[dict[str, Any]],
+    category_questions: list[dict[str, Any]],
+    all_questions: list[dict[str, Any]],
+    category: str,
+    game_code: str,
+) -> list[dict[str, Any]]:
+    questions_with_choices = []
+    for index, question in enumerate(round_questions):
+        correct_answer = clean(question["answer"])
+        if question["choices"]:
+            updated_question = dict(question)
+            updated_question["round_position"] = index + 1
+            questions_with_choices.append(updated_question)
+            continue
+
+        wrong_answers = unique_wrong_answers(category_questions, correct_answer)
+        if len(wrong_answers) < CHOICE_COUNT - 1:
+            wrong_answers = unique_wrong_answers(all_questions, correct_answer)
+
+        seed_parts = [
+            ROUND_SEED,
+            category,
+            game_code,
+            str(question["id"]),
+            question["question"],
+            "choices",
+        ]
+        rng = random.Random(game_code_seed("|".join(seed_parts)))
+        distractors = rng.sample(wrong_answers, min(CHOICE_COUNT - 1, len(wrong_answers)))
+        choices = unique_choices([correct_answer, *distractors])
+        rng.shuffle(choices)
+
+        updated_question = dict(question)
+        updated_question["choices"] = choices
+        updated_question["round_position"] = index + 1
+        questions_with_choices.append(updated_question)
+    return questions_with_choices
+
+
+def build_round_questions(questions: list[dict[str, Any]], category: str, game_code: str) -> list[dict[str, Any]]:
     normalized = clean(game_code).casefold()
     round_number = int(normalized.removeprefix("round")) - 1
-    question_order = list(questions)
-    random.Random(game_code_seed(ROUND_SEED)).shuffle(question_order)
+    category_questions = questions_for_category(questions, category)
+    question_order = list(category_questions)
+    random.Random(game_code_seed(f"{ROUND_SEED}|{category}")).shuffle(question_order)
     start = round_number * ROUND_SIZE
-    return question_order[start : start + ROUND_SIZE]
+    round_questions = question_order[start : start + ROUND_SIZE]
+    return add_multiple_choice_options(round_questions, category_questions, questions, category, game_code)
 
 
 def first_value(row: dict[str, Any], *names: str) -> str:
@@ -271,6 +347,7 @@ def load_default_questions(path: str, modified_at: float) -> list[dict[str, Any]
 def reset_game() -> None:
     for key in [
         "player_name",
+        "category",
         "game_code",
         "game_questions",
         "current_index",
@@ -287,10 +364,11 @@ def reset_game() -> None:
             st.session_state.pop(key, None)
 
 
-def start_game(player_name: str, game_code: str, questions: list[dict[str, Any]]) -> None:
+def start_game(player_name: str, category: str, game_code: str, questions: list[dict[str, Any]]) -> None:
     st.session_state.player_name = player_name.strip()
+    st.session_state.category = category
     st.session_state.game_code = game_code.strip()
-    st.session_state.game_questions = build_round_questions(questions, game_code)
+    st.session_state.game_questions = build_round_questions(questions, category, game_code)
     st.session_state.current_index = 0
     st.session_state.score = 0
     st.session_state.answers = []
@@ -364,6 +442,9 @@ def render_scoreboard(total_questions: int) -> None:
     with st.sidebar:
         st.subheader("Game")
         st.write(f"Player: **{st.session_state.player_name}**")
+        category = st.session_state.get("category", "")
+        if category:
+            st.write(f"Category: **{category}**")
         game_code = st.session_state.get("game_code", "")
         if game_code:
             st.write(f"Code: **{game_code}**")
@@ -400,23 +481,26 @@ def main() -> None:
     if not active_questions:
         st.warning("Add questions to questions.csv to start.")
         return
-    round_codes = round_codes_for(active_questions)
-    if not round_codes:
-        st.warning(f"questions.csv needs at least {ROUND_SIZE} questions to start.")
-        return
-
     if "game_questions" not in st.session_state:
-        with st.form("start_form"):
-            player_name = st.text_input("Name", placeholder="Put your name in")
-            game_code = st.selectbox("Round code", round_codes)
-            st.caption(f"{len(round_codes)} rounds available. Each round gives everyone the same {ROUND_SIZE} questions.")
-            start = st.form_submit_button("Start game", use_container_width=True)
-            if start:
-                if not player_name.strip():
-                    st.error("Enter a name to start.")
-                else:
-                    start_game(player_name, game_code, active_questions)
-                    st.rerun()
+        player_name = st.text_input("Name", placeholder="Put your name in")
+        category = st.selectbox("Category", category_options_for(active_questions))
+        category_questions = questions_for_category(active_questions, category)
+        round_codes = round_codes_for(category_questions)
+        if not round_codes:
+            st.warning(f"{category} needs at least {ROUND_SIZE} questions to start.")
+            return
+        game_code = st.selectbox("Round code", round_codes)
+        st.caption(
+            f"{len(round_codes)} rounds available in {category}. "
+            f"Each round gives everyone the same multiple-choice questions."
+        )
+        start = st.button("Start game", use_container_width=True)
+        if start:
+            if not player_name.strip():
+                st.error("Enter a name to start.")
+            else:
+                start_game(player_name, category, game_code, active_questions)
+                st.rerun()
         return
 
     total_questions = len(st.session_state.game_questions)
